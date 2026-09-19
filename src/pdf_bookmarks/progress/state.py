@@ -43,6 +43,7 @@ class ProgressState:
     # Bookmark generation - detailed per TOC page
     toc_pages: List = field(default_factory=list)  # Cached TOC page images
     toc_page_processed: List[bool] = field(default_factory=list)  # Track which TOC pages are done
+    toc_page_results: Dict[str, str] = field(default_factory=dict)
     current_toc_page_index: int = 0
     accumulated_bookmarks: str = ""
     last_entry: str = ""
@@ -108,7 +109,7 @@ class ProgressState:
             # Restart from the current TOC page
             return "generating_bookmarks"
         elif self.error_step == "refining_bookmarks":
-            return "generating_bookmarks"
+            return "refining_bookmarks"
         elif self.error_step == "applying_bookmarks":
             return "refining_bookmarks"
         return self.error_step

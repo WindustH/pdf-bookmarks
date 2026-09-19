@@ -93,28 +93,6 @@ BookmarkPageNumber: 7
 Output ONLY the bookmark entries from this page, no explanation.
     """.strip()
 
-    SUBSEQUENT_PAGE_PROMPT = """
-You are analyzing a book's table of contents page by page.
-
-Context: Previous pages have already been processed. The last bookmark extracted was:
-```
-{last_entry}
-```
-
-Your task: Extract ONLY NEW bookmark entries from this page that are NOT duplicates of previous pages.
-
-Rules:
-- ONLY include entries that correspond to Arabic-numbered pages (e.g., 1, 2, 15).
-- EXCLUDE any entry whose page number is a Roman numeral (e.g., i, ii, iii, vi, xii).
-- Do NOT repeat entries that were on previous pages
-- For each valid entry, output:
-BookmarkBegin
-BookmarkTitle: [Exact title from the table of contents]
-BookmarkLevel: [1 for top-level, 2 for subsection, etc.]
-BookmarkPageNumber: [Original page number as Arabic integer]
-
-Output ONLY the NEW bookmark entries from this page, no explanation.
-    """.strip()
 
 
 class BookmarkRefinementPrompts:
@@ -137,5 +115,9 @@ Here is the bookmark text to review:
 {bookmark_text}
 ```
 
-Output ONLY the corrected pdftk bookmark entries, with no explanation or extra text.
+Use replace_text tool calls to make only the necessary local corrections to the current text.
+Each old_text must match exactly once; include surrounding text when necessary.
+Edits apply sequentially, so later edits must refer to the text after earlier edits.
+Never output or replace the entire document. Preserve unaffected titles and page numbers.
+Call finish_refinement when done, including when no edits are needed.
     """.strip()

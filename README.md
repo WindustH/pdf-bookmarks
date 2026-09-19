@@ -152,6 +152,8 @@ API_KEY=your_api_key_here
 BASE_URL=https://api.example.com/v1
 VISION_MODEL=gpt-4-vision-preview
 TEXT_MODEL=gpt-4
+TOC_WORKERS=4
+REFINE_TIMEOUT=600
 ```
 
 ## 使用方法
@@ -177,8 +179,8 @@ uv run python src/main.py C:\Users\YourName\Documents\ebook.pdf C:\Users\YourNam
 
 1. **扫描 TOC 页**：逐页扫描 PDF，使用视觉 LLM 识别目录页
 2. **计算页码偏移**：找到第一个条目的页码，在实际 PDF 中定位其内容，计算偏移量
-3. **提取书签信息**：从 TOC 页提取书签条目
-4. **优化书签**：使用文本 LLM 检查和修复书签结构
+3. **提取书签信息**：独立并行处理目录页（`TOC_WORKERS`，默认 4），不传入前页上下文；逐页保存结果并按原页序合并
+4. **优化书签**：文本 LLM 通过 `replace_text` tool call 精确修改局部原文，通过 `finish_refinement` 完成检查，无需重新输出全文
 5. **应用偏移量**：根据计算的偏移量调整页码
 6. **生成 PDF**：使用 pdftk 将书签应用到 PDF
 
@@ -196,3 +198,11 @@ which pdftk
 where pdftk
 ```
 
+
+流式文本达到输出长度限制时，自动携带已输出内容续写，最多续写 20 次；连接异常或未收到完成标志时不将半截内容视为成功。并行提取期间仅显示每页完成状态，避免流式文字交错。文本模型及其 API 需支持 Chat Completions function calling。
+
+断点续跑会复用已保存的逐页结果，只重试缺失页；旧版仅保存合并文本的提取进度会重新提取目录页。
+
+运行离线回归测试：`uv run python -m unittest discover -s tests -v`。
+
+refine 使用流式 tool call，收到完整参数与结束标志后才执行修改。`REFINE_TIMEOUT` 控制单次网络读取的等待上限（秒，默认 600），不是整个 refine 阶段的总时限；有持续流数据时可继续运行。服务端或代理的超时限制仍可能提前终止请求。

@@ -1,9 +1,14 @@
 """Vision LLM client for processing PDF TOC pages."""
 
 import sys
+import json
+import re
+import time
+import math
 from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image
-from openai import OpenAI
+from openai import OpenAI, APITimeoutError
+from openai.types.chat import ChatCompletionMessage
 
 from pdf_bookmarks.core.image import PDFImageProcessor
 from pdf_bookmarks.utils import Colors, Log, clean_llm_response
@@ -11,7 +16,6 @@ from pdf_bookmarks.prompts import (
     TOCDetectionPrompts,
     TOCExtractionPrompts,
     ContentVerificationPrompts,
-    BookmarkGenerationPrompts,
     BookmarkRefinementPrompts,
 )
 
@@ -19,7 +23,10 @@ from pdf_bookmarks.prompts import (
 class VisionLLMClient:
     """Handles all interactions with the vision language model."""
 
-    def __init__(self, api_key: str, base_url: str, vision_model: str, text_model: str):
+    def __init__(self, api_key: str, base_url: str, vision_model: str, text_model: str, refine_timeout: float = 600):
+        if not math.isfinite(refine_timeout) or refine_timeout <= 0:
+            raise ValueError("REFINE_TIMEOUT must be a positive finite number")
+        self.refine_timeout = refine_timeout
         self.client = OpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -27,7 +34,7 @@ class VisionLLMClient:
         self.vision_model = vision_model
         self.text_model = text_model
 
-    def _send_vision_request(self, images: List[str], prompt: str, stream: bool = True, timeout: float = 120) -> str:
+    def _send_vision_request(self, images: List[str], prompt: str, stream: bool = True, timeout: float = 120, display: bool = True) -> str:
         """Send a request to the vision LLM with images and prompt."""
         content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
 
@@ -42,40 +49,67 @@ class VisionLLMClient:
                 }
             )
 
-        response = self.client.chat.completions.create(
-            model=self.vision_model,
-            messages=[{"role": "user", "content": content}],
-            stream=stream,
-            timeout=timeout,
+        return self._complete_text(
+            self.vision_model, [{"role": "user", "content": content}],
+            stream=stream, timeout=timeout, display=display,
         )
 
-        if stream:
-            return self._process_streaming_response(response)
-        else:
-            return response.choices[0].message.content or ""
-
-    def _process_streaming_response(self, response) -> str:
-        """Process streaming response and display in real-time."""
+    def _complete_text(self, model, messages, *, stream=True, timeout=60, display=True):
+        """Continue length-limited responses without changing their exact text."""
+        initial_messages = list(messages)
         full_content = ""
-        first_chunk = True
+        for attempt in range(21):
+            response = self.client.chat.completions.create(
+                model=model, messages=messages, stream=stream, timeout=timeout,
+            )
+            if stream:
+                content, reason = self._process_streaming_response(response, display=display)
+            else:
+                content = response.choices[0].message.content or ""
+                reason = response.choices[0].finish_reason
+            full_content += content
+            if reason == "stop":
+                return full_content
+            if reason != "length":
+                raise RuntimeError(f"Incomplete model response: finish_reason={reason!r}")
+            if not content or attempt == 20:
+                raise RuntimeError("Model output remains truncated; continuation made no progress or reached its limit")
+            messages = initial_messages + [
+                {"role": "assistant", "content": full_content},
+                {"role": "user", "content": (
+                    "Your output was truncated by the output length limit. Continue exactly "
+                    "where it ended, including completing any partial line or word. "
+                    "Output only the missing suffix, without repeating text, adding a "
+                    "preamble, code fences, or an extra separator/newline."
+                )},
+            ]
+        raise RuntimeError("Continuation limit reached")
 
-        for chunk in response:
-            if chunk.choices and chunk.choices[0].delta.content:
-                content = chunk.choices[0].delta.content
-                full_content += content
-
-                if first_chunk:
-                    sys.stdout.write(f"{Colors.DIM}  Streaming: {Colors.RESET}")
-                    first_chunk = False
-
-                sys.stdout.write(content)
+    def _process_streaming_response(self, response, *, display=True):
+        """Collect text and finish reason; parallel workers suppress terminal output."""
+        parts = []
+        reason = None
+        try:
+            for chunk in response:
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                if choice.finish_reason is not None:
+                    reason = choice.finish_reason
+                content = choice.delta.content
+                if content:
+                    if display:
+                        if not parts:
+                            sys.stdout.write(f"{Colors.DIM}  Streaming: {Colors.RESET}")
+                        sys.stdout.write(content)
+                        sys.stdout.flush()
+                    parts.append(content)
+        finally:
+            response.close()
+            if display and parts:
+                sys.stdout.write(f"{Colors.RESET}\n")
                 sys.stdout.flush()
-
-        if not first_chunk:
-            sys.stdout.write(f"{Colors.RESET}\n")
-            sys.stdout.flush()
-
-        return full_content
+        return "".join(parts), reason
 
     def is_toc_page(self, page_image: Image.Image) -> bool:
         """Determine if a page is a table of contents page."""
@@ -170,35 +204,131 @@ class VisionLLMClient:
 
     def _send_text_request(self, prompt: str, stream: bool = True, timeout: float = 60) -> str:
         """Send a text-only request to the text LLM."""
-        response = self.client.chat.completions.create(
-            model=self.text_model,
-            messages=[{"role": "user", "content": prompt}],
-            stream=stream,
-            timeout=timeout,
+        return self._complete_text(
+            self.text_model, [{"role": "user", "content": prompt}],
+            stream=stream, timeout=timeout,
         )
 
-        if stream:
-            return self._process_streaming_response(response)
-        else:
-            return response.choices[0].message.content or ""
+    def _request_refinement(self, messages, tools):
+        """Collect complete streamed tool arguments before allowing any edits."""
+        parts, calls = [], {}
+        reason = None
+        last_update = time.monotonic()
+        try:
+            response = self.client.chat.completions.create(
+                model=self.text_model, messages=messages, tools=tools,
+                tool_choice="auto", parallel_tool_calls=False, stream=True,
+                timeout=self.refine_timeout,
+            )
+            try:
+                for chunk in response:
+                    if time.monotonic() - last_update >= 15:
+                        Log.detail("Refinement model is responding; waiting for a complete tool call...")
+                        last_update = time.monotonic()
+                    if not chunk.choices:
+                        continue
+                    choice = chunk.choices[0]
+                    if choice.finish_reason is not None:
+                        reason = choice.finish_reason
+                    delta = choice.delta
+                    if delta.content:
+                        parts.append(delta.content)
+                    for fragment in delta.tool_calls or []:
+                        call = calls.setdefault(fragment.index, {
+                            "id": "", "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        })
+                        if fragment.id:
+                            call["id"] = fragment.id
+                        if fragment.function:
+                            call["function"]["name"] += fragment.function.name or ""
+                            call["function"]["arguments"] += fragment.function.arguments or ""
+            finally:
+                response.close()
+        except APITimeoutError as exc:
+            raise RuntimeError(
+                f"Refinement request timed out (REFINE_TIMEOUT={self.refine_timeout:g}s). "
+                "Increase REFINE_TIMEOUT in model.env and retry with --resume."
+            ) from exc
+        if any(not call["id"] or not call["function"]["name"] for call in calls.values()):
+            raise RuntimeError("Incomplete refinement tool call metadata")
+        message = ChatCompletionMessage(
+            role="assistant", content="".join(parts) or None,
+            tool_calls=[calls[i] for i in sorted(calls)] or None,
+        )
+        return message, reason
 
     def refine_bookmarks_with_text_model(self, bookmark_text: str) -> str:
-        """Use text model to check and fix the generated bookmarks."""
-        original_len = len(bookmark_text)
-        prompt = BookmarkRefinementPrompts.REFINE_BOOKMARKS.format(bookmark_text=bookmark_text)
-        response = self._send_text_request(prompt)
-        refined = clean_llm_response(response)
-        refined_len = len(refined)
-
-        # Validate character count didn't change too much
-        if original_len > 0:
-            change_ratio = abs(refined_len - original_len) / original_len
-            if change_ratio > 0.1:  # More than 10% change
-                raise RuntimeError(
-                    f"Refinement output size changed by {change_ratio*100:.1f}% "
-                    f"(original: {original_len} chars, refined: {refined_len} chars). "
-                    "This suggests the model output is malformed. Please try again or use a different model."
-                )
-
-        Log.detail(f"Refinement: {original_len} → {refined_len} chars ({(change_ratio if original_len > 0 else 0)*100:.1f}% change)")
-        return refined
+        """Apply validated, exact local edits through a tool conversation."""
+        messages = [{"role": "user", "content": BookmarkRefinementPrompts.REFINE_BOOKMARKS.format(
+            bookmark_text=bookmark_text
+        )}]
+        tools = [{"type": "function", "function": {
+            "name": "replace_text",
+            "description": "Replace one unique exact substring in the CURRENT bookmark text. Use minimal surrounding context to make the match unique.",
+            "parameters": {"type": "object", "properties": {
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+            }, "required": ["old_text", "new_text"], "additionalProperties": False},
+        }}, {"type": "function", "function": {
+            "name": "finish_refinement",
+            "description": "Finish after all necessary local corrections have been applied, or when no corrections are needed.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        }}]
+        current = bookmark_text
+        text_only_rounds = 0
+        for round_index in range(100):
+            Log.detail(f"Refinement round {round_index + 1}: waiting for model (read timeout {self.refine_timeout:g}s)")
+            message, finish_reason = self._request_refinement(messages, tools)
+            # Thinking-mode providers may reject forced tool choice. Enforce
+            # edits through tools locally, even when the API uses auto choice.
+            if finish_reason == "stop" and not message.tool_calls:
+                text_only_rounds += 1
+                if text_only_rounds >= 3:
+                    raise RuntimeError("Refinement model repeatedly returned text instead of tool calls")
+                messages.append(message.model_dump(exclude_none=True))
+                messages.append({"role": "user", "content": (
+                    "Your text response has not changed the bookmark document. "
+                    "Call replace_text for local edits, or call finish_refinement "
+                    "if the current document needs no further changes. Do not output the document."
+                )})
+                continue
+            if finish_reason != "tool_calls" or not message.tool_calls:
+                raise RuntimeError(f"Refinement did not return complete tool calls: {finish_reason}")
+            text_only_rounds = 0
+            messages.append(message.model_dump(exclude_none=True))
+            calls = message.tool_calls
+            for call in calls:
+                try:
+                    args = json.loads(call.function.arguments)
+                    if not isinstance(args, dict):
+                        raise ValueError("Tool arguments must be an object")
+                    if call.function.name == "finish_refinement":
+                        if len(calls) != 1 or args:
+                            raise ValueError("Call finish_refinement alone with no arguments")
+                        pattern = (r"BookmarkBegin\nBookmarkTitle: [^\n]+\n"
+                                   r"BookmarkLevel: [1-9][0-9]*\n"
+                                   r"BookmarkPageNumber: [1-9][0-9]*(?:\n|$)")
+                        if current.strip() and re.sub(pattern, "", current.strip()).strip():
+                            raise ValueError("Current text is not valid pdftk bookmark blocks; fix formatting before finishing")
+                        if bookmark_text.strip() and not current.strip():
+                            raise ValueError("Refinement cannot remove all bookmarks")
+                        Log.detail(f"Refinement: {len(bookmark_text)} → {len(current)} chars")
+                        return current
+                    if call.function.name != "replace_text":
+                        raise ValueError("Unknown tool")
+                    old, new = args.get("old_text"), args.get("new_text")
+                    if not isinstance(old, str) or not old or not isinstance(new, str):
+                        raise ValueError("old_text must be nonempty and new_text must be a string")
+                    if old.strip() == current.strip():
+                        raise ValueError("Whole-document replacement is forbidden; edit individual fields or entries")
+                    matches = current.count(old)
+                    if matches != 1:
+                        raise ValueError(f"old_text matches {matches} times; supply exact, unique context")
+                    current = current.replace(old, new, 1)
+                    result = {"ok": True}
+                except (ValueError, TypeError) as exc:
+                    result = {"ok": False, "error": str(exc)}
+                messages.append({"role": "tool", "tool_call_id": call.id,
+                                 "content": json.dumps(result, ensure_ascii=False)})
+        raise RuntimeError("Refinement tool round limit reached")

@@ -1,6 +1,7 @@
 """Main PDF bookmark processor orchestrating the entire workflow."""
 
 from typing import Optional, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pdf_bookmarks.config import Config
 from pdf_bookmarks.core import VisionLLMClient, PDFImageProcessor, TOCPageDetector
@@ -21,6 +22,7 @@ class PDFBookmarkProcessor:
             base_url=self.config.base_url,
             vision_model=self.config.vision_model,
             text_model=self.config.text_model,
+            refine_timeout=self.config.refine_timeout,
         )
         self.toc_detector = TOCPageDetector(self.vision_client)
         self.bookmark_generator = BookmarkGenerator(self.vision_client)
@@ -520,8 +522,10 @@ class PDFBookmarkProcessor:
                 # Check if we need to reset and generate fresh bookmarks
                 # (e.g., coming from verification step, not resuming a partial generation)
                 needs_fresh_generation = (
-                    not state.accumulated_bookmarks or
-                    "BookmarkBegin" not in state.accumulated_bookmarks
+                    not state.toc_page_results and (
+                        not state.accumulated_bookmarks or
+                        "BookmarkBegin" not in state.accumulated_bookmarks
+                    )
                 )
 
                 if needs_fresh_generation:
@@ -601,59 +605,58 @@ class PDFBookmarkProcessor:
         self, toc_pages, state: ProgressState, progress_manager: ProgressManager
     ) -> str:
         """Generate bookmarks with progress tracking for resumability."""
-        accumulated = state.accumulated_bookmarks
-        last_entry = state.last_entry
-        start_index = state.current_toc_page_index
+        count = len(toc_pages)
+        # Legacy checkpoints only contain a combined prefix. Re-extract once so
+        # every saved result has a reliable page identity.
+        if not state.toc_page_results:
+            state.toc_page_processed = [False] * count
+            state.accumulated_bookmarks = ""
+        state.toc_page_processed = [str(i) in state.toc_page_results for i in range(count)]
 
-        for i in range(start_index, len(toc_pages)):
-            # Skip already processed pages
-            if state.toc_page_processed and i < len(state.toc_page_processed) and state.toc_page_processed[i]:
-                Log.detail(f"Skipping already processed TOC page {i + 1}")
-                # Update last_entry from accumulated
-                if accumulated:
-                    entries = accumulated.split("BookmarkBegin")
-                    if entries:
-                        last_entry = entries[-1].strip()
-                state.last_entry = last_entry
-                progress_manager.save(state)
-                continue
+        def save_results():
+            state.accumulated_bookmarks = "\n".join(
+                state.toc_page_results[str(i)] for i in range(count)
+                if state.toc_page_results.get(str(i))
+            )
+            state.total_bookmarks_generated = state.accumulated_bookmarks.count("BookmarkBegin")
+            state.current_toc_page_index = next(
+                (i for i in range(count) if not state.toc_page_processed[i]), count
+            )
+            progress_manager.save(state)
 
+        def extract_page(i):
+            base64_image = PDFImageProcessor.convert_to_base64_webp(toc_pages[i])
+            response = self.vision_client._send_vision_request(
+                [base64_image], BookmarkGenerationPrompts.FIRST_PAGE_PROMPT, display=False,
+            )
+            return clean_llm_response(response).strip()
+
+        save_results()
+        pending = [i for i in range(count) if not state.toc_page_processed[i]]
+        if not pending:
+            return state.accumulated_bookmarks.strip()
+        workers = max(1, min(self.config.toc_workers, len(pending)))
+        Log.detail(f"Extracting {len(pending)} TOC pages independently with {workers} workers")
+        executor = ThreadPoolExecutor(max_workers=workers)
+        futures = {executor.submit(extract_page, i): i for i in pending}
+        failures = []
+        try:
+            for future in as_completed(futures):
+                i = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    failures.append((i, exc))
+                    Log.warn(f"TOC page {i + 1} failed: {exc}")
+                    continue
+                state.toc_page_results[str(i)] = result
+                state.toc_page_processed[i] = True
+                save_results()
+                Log.detail(f"TOC page {i + 1}/{count} saved ({sum(state.toc_page_processed)}/{count} complete)")
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        if failures:
+            i, exc = failures[0]
             state.current_toc_page_index = i
-            progress_manager.save(state)
-
-            page_image = toc_pages[i]
-
-            Log.separator()
-            print(f"{Colors.BOLD}{Colors.CYAN}[Page {i + 1}/{len(toc_pages)}]{Colors.RESET} Processing...")
-
-            prev_count = accumulated.count("BookmarkBegin")
-            if prev_count > 0:
-                Log.detail(f"Context: {prev_count} existing bookmarks")
-
-            base64_image = PDFImageProcessor.convert_to_base64_webp(page_image)
-
-            if i == 0:
-                page_prompt = BookmarkGenerationPrompts.FIRST_PAGE_PROMPT
-            else:
-                page_prompt = BookmarkGenerationPrompts.SUBSEQUENT_PAGE_PROMPT.format(last_entry=last_entry)
-
-            Log.detail(f"Sending request to {self.vision_client.vision_model}...")
-            raw_response = self.vision_client._send_vision_request([base64_image], page_prompt)
-            new_bookmarks = clean_llm_response(raw_response)
-
-            if new_bookmarks.strip():
-                accumulated += "\n" + new_bookmarks.strip()
-                last_entry = new_bookmarks.strip().split("BookmarkBegin")[-1].strip()
-
-            new_count = accumulated.count("BookmarkBegin")
-            added_count = new_count - prev_count
-            print(f"{Colors.GREEN}  Result:{Colors.RESET} {new_count} total bookmarks ({added_count} new)")
-            Log.separator()
-
-            state.accumulated_bookmarks = accumulated
-            state.last_entry = last_entry
-            state.total_bookmarks_generated = new_count
-            state.toc_page_processed[i] = True
-            progress_manager.save(state)
-
-        return accumulated.strip()
+            raise RuntimeError(f"TOC page {i + 1} failed: {exc}") from exc
+        return state.accumulated_bookmarks.strip()

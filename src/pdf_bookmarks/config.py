@@ -18,4 +18,6 @@ class Config:
     base_url: str = os.getenv("BASE_URL", "")
     vision_model: str = os.getenv("VISION_MODEL", "")
     text_model: str = os.getenv("TEXT_MODEL", "")
+    refine_timeout: float = float(os.getenv("REFINE_TIMEOUT", "600"))
+    toc_workers: int = int(os.getenv("TOC_WORKERS", "4"))
     temp_bookmark_file: str = "bookmarks.txt"
